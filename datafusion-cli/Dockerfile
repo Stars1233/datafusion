@@ -27,7 +27,7 @@ RUN rustup component add rustfmt
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:12.10-slim
 
 COPY --from=builder /usr/src/datafusion/datafusion-cli/target/release/datafusion-cli /usr/local/bin
 
