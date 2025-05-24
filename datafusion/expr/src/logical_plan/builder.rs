@@ -501,6 +501,21 @@ impl LogicalPlanBuilder {
         if table_scan.filters.is_empty() {
             if let Some(p) = table_scan.source.get_logical_plan() {
                 let sub_plan = p.into_owned();
+
+                if let Some(proj) = table_scan.projection {
+                    let projection_exprs = proj
+                        .into_iter()
+                        .map(|i| {
+                            Expr::Column(Column::from(
+                                sub_plan.schema().qualified_field(i),
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    return Self::new(sub_plan)
+                        .project(projection_exprs)?
+                        .alias(table_scan.table_name);
+                }
+
                 // Ensures that the reference to the inlined table remains the
                 // same, meaning we don't have to change any of the parent nodes
                 // that reference this table.
@@ -586,7 +601,7 @@ impl LogicalPlanBuilder {
     /// Apply a filter which is used for a having clause
     pub fn having(self, expr: impl Into<Expr>) -> Result<Self> {
         let expr = normalize_col(expr.into(), &self.plan)?;
-        Filter::try_new_with_having(expr, self.plan)
+        Filter::try_new(expr, self.plan)
             .map(LogicalPlan::Filter)
             .map(Self::from)
     }
@@ -1122,12 +1137,24 @@ impl LogicalPlanBuilder {
         for (l, r) in &on {
             if self.plan.schema().has_column(l)
                 && right.schema().has_column(r)
-                && can_hash(self.plan.schema().field_from_column(l)?.data_type())
+                && can_hash(
+                    datafusion_common::ExprSchema::field_from_column(
+                        self.plan.schema(),
+                        l,
+                    )?
+                    .data_type(),
+                )
             {
                 join_on.push((Expr::Column(l.clone()), Expr::Column(r.clone())));
             } else if self.plan.schema().has_column(l)
                 && right.schema().has_column(r)
-                && can_hash(self.plan.schema().field_from_column(r)?.data_type())
+                && can_hash(
+                    datafusion_common::ExprSchema::field_from_column(
+                        self.plan.schema(),
+                        r,
+                    )?
+                    .data_type(),
+                )
             {
                 join_on.push((Expr::Column(r.clone()), Expr::Column(l.clone())));
             } else {
@@ -1486,7 +1513,7 @@ pub fn change_redundant_column(fields: &Fields) -> Vec<Field> {
             // Loop until we find a name that hasn't been used
             while seen.contains(&new_name) {
                 *count += 1;
-                new_name = format!("{}:{}", base_name, count);
+                new_name = format!("{base_name}:{count}");
             }
 
             seen.insert(new_name.clone());
@@ -2597,7 +2624,7 @@ mod tests {
             // Check unnested struct field is a scalar
             let field = plan
                 .schema()
-                .field_with_name(None, &format!("struct_singular.{}", field_name))
+                .field_with_name(None, &format!("struct_singular.{field_name}"))
                 .unwrap();
             assert_eq!(&DataType::UInt32, field.data_type());
         }
@@ -2680,7 +2707,7 @@ mod tests {
         for field_name in &["a", "b"] {
             let field = plan
                 .schema()
-                .field_with_name(None, &format!("struct_singular.{}", field_name))
+                .field_with_name(None, &format!("struct_singular.{field_name}"))
                 .unwrap();
             assert_eq!(&DataType::UInt32, field.data_type());
         }

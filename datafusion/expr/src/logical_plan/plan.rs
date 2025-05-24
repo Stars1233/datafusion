@@ -630,12 +630,9 @@ impl LogicalPlan {
                 // todo it isn't clear why the schema is not recomputed here
                 Ok(LogicalPlan::Values(Values { schema, values }))
             }
-            LogicalPlan::Filter(Filter {
-                predicate,
-                input,
-                having,
-            }) => Filter::try_new_internal(predicate, input, having)
-                .map(LogicalPlan::Filter),
+            LogicalPlan::Filter(Filter { predicate, input }) => {
+                Filter::try_new(predicate, input).map(LogicalPlan::Filter)
+            }
             LogicalPlan::Repartition(_) => Ok(self),
             LogicalPlan::Window(Window {
                 input,
@@ -1721,7 +1718,7 @@ impl LogicalPlan {
                     LogicalPlan::RecursiveQuery(RecursiveQuery {
                         is_distinct, ..
                     }) => {
-                        write!(f, "RecursiveQuery: is_distinct={}", is_distinct)
+                        write!(f, "RecursiveQuery: is_distinct={is_distinct}")
                     }
                     LogicalPlan::Values(Values { ref values, .. }) => {
                         let str_values: Vec<_> = values
@@ -1964,7 +1961,7 @@ impl LogicalPlan {
                         };
                         write!(
                             f,
-                            "Limit: skip={}, fetch={}", skip_str,fetch_str,
+                            "Limit: skip={skip_str}, fetch={fetch_str}",
                         )
                     }
                     LogicalPlan::Subquery(Subquery { .. }) => {
@@ -2259,8 +2256,6 @@ pub struct Filter {
     pub predicate: Expr,
     /// The incoming logical plan
     pub input: Arc<LogicalPlan>,
-    /// The flag to indicate if the filter is a having clause
-    pub having: bool,
 }
 
 impl Filter {
@@ -2269,13 +2264,14 @@ impl Filter {
     /// Notes: as Aliases have no effect on the output of a filter operator,
     /// they are removed from the predicate expression.
     pub fn try_new(predicate: Expr, input: Arc<LogicalPlan>) -> Result<Self> {
-        Self::try_new_internal(predicate, input, false)
+        Self::try_new_internal(predicate, input)
     }
 
     /// Create a new filter operator for a having clause.
     /// This is similar to a filter, but its having flag is set to true.
+    #[deprecated(since = "48.0.0", note = "Use `try_new` instead")]
     pub fn try_new_with_having(predicate: Expr, input: Arc<LogicalPlan>) -> Result<Self> {
-        Self::try_new_internal(predicate, input, true)
+        Self::try_new_internal(predicate, input)
     }
 
     fn is_allowed_filter_type(data_type: &DataType) -> bool {
@@ -2289,11 +2285,7 @@ impl Filter {
         }
     }
 
-    fn try_new_internal(
-        predicate: Expr,
-        input: Arc<LogicalPlan>,
-        having: bool,
-    ) -> Result<Self> {
+    fn try_new_internal(predicate: Expr, input: Arc<LogicalPlan>) -> Result<Self> {
         // Filter predicates must return a boolean value so we try and validate that here.
         // Note that it is not always possible to resolve the predicate expression during plan
         // construction (such as with correlated subqueries) so we make a best effort here and
@@ -2309,7 +2301,6 @@ impl Filter {
         Ok(Self {
             predicate: predicate.unalias_nested().data,
             input,
-            having,
         })
     }
 
@@ -2860,7 +2851,7 @@ impl Union {
                 // Generate unique field name
                 let name = if let Some(count) = name_counts.get_mut(&base_name) {
                     *count += 1;
-                    format!("{}_{}", base_name, count)
+                    format!("{base_name}_{count}")
                 } else {
                     name_counts.insert(base_name.clone(), 0);
                     base_name
@@ -3657,7 +3648,7 @@ fn calc_func_dependencies_for_project(
                     .unwrap_or(vec![]))
             }
             _ => {
-                let name = format!("{}", expr);
+                let name = format!("{expr}");
                 Ok(input_fields
                     .iter()
                     .position(|item| *item == name)
@@ -5280,12 +5271,7 @@ digraph {
             )?;
 
             let fields = join.schema.fields();
-            assert_eq!(
-                fields.len(),
-                6,
-                "Expected 6 fields for {:?} join",
-                join_type
-            );
+            assert_eq!(fields.len(), 6, "Expected 6 fields for {join_type:?} join");
 
             for (i, field) in fields.iter().enumerate() {
                 let expected_nullable = match (i, &join_type) {
