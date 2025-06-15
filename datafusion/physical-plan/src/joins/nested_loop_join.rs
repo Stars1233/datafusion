@@ -259,10 +259,10 @@ impl NestedLoopJoinExec {
             None,
             // No on columns in nested loop join
             &[],
-        );
+        )?;
 
         let mut output_partitioning =
-            asymmetric_join_output_partitioning(left, right, &join_type);
+            asymmetric_join_output_partitioning(left, right, &join_type)?;
 
         let emission_type = if left.boundedness().is_unbounded() {
             EmissionType::Final
@@ -567,9 +567,16 @@ impl ExecutionPlan for NestedLoopJoinExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
+        self.partition_statistics(None)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if partition.is_some() {
+            return Ok(Statistics::new_unknown(&self.schema()));
+        }
         estimate_join_statistics(
-            Arc::clone(&self.left),
-            Arc::clone(&self.right),
+            self.left.partition_statistics(None)?,
+            self.right.partition_statistics(None)?,
             vec![],
             &self.join_type,
             &self.join_schema,
@@ -1081,22 +1088,18 @@ pub(crate) mod tests {
             vec![batch]
         };
 
-        let mut source =
-            TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None).unwrap();
-        if !sorted_column_names.is_empty() {
-            let mut sort_info = LexOrdering::default();
-            for name in sorted_column_names {
-                let index = schema.index_of(name).unwrap();
-                let sort_expr = PhysicalSortExpr {
-                    expr: Arc::new(Column::new(name, index)),
-                    options: SortOptions {
-                        descending: false,
-                        nulls_first: false,
-                    },
-                };
-                sort_info.push(sort_expr);
-            }
-            source = source.try_with_sort_information(vec![sort_info]).unwrap();
+        let mut sort_info = vec![];
+        for name in sorted_column_names {
+            let index = schema.index_of(name).unwrap();
+            let sort_expr = PhysicalSortExpr::new(
+                Arc::new(Column::new(name, index)),
+                SortOptions::new(false, false),
+            );
+            sort_info.push(sort_expr);
+        }
+        let mut source = TestMemoryExec::try_new(&[batches], schema, None).unwrap();
+        if let Some(ordering) = LexOrdering::new(sort_info) {
+            source = source.try_with_sort_information(vec![ordering]).unwrap();
         }
 
         Arc::new(TestMemoryExec::update_cache(Arc::new(source)))
@@ -1506,7 +1509,7 @@ pub(crate) mod tests {
 
             assert_contains!(
                 err.to_string(),
-                "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: NestedLoopJoinLoad[0]"
+                "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as:\n  NestedLoopJoinLoad[0]"
             );
         }
 
@@ -1663,11 +1666,7 @@ pub(crate) mod tests {
                         .into_iter()
                         .zip(prev_values)
                         .all(|(current, prev)| current >= prev),
-                    "batch_index: {} row: {} current: {:?}, prev: {:?}",
-                    batch_index,
-                    row,
-                    current_values,
-                    prev_values
+                    "batch_index: {batch_index} row: {row} current: {current_values:?}, prev: {prev_values:?}"
                 );
                 prev_values = current_values;
             }

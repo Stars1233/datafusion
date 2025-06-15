@@ -92,5 +92,5 @@ pub mod udaf {
 }
 
 pub mod coalesce;
-#[cfg(test)]
 pub mod test;
+pub mod yield_stream;

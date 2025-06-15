@@ -17,7 +17,7 @@
 
 pub use crate::display::{DefaultDisplay, DisplayAs, DisplayFormatType, VerboseDisplay};
 use crate::filter_pushdown::{
-    filter_pushdown_not_supported, FilterDescription, FilterPushdownResult,
+    ChildPushdownResult, FilterDescription, FilterPushdownPropagation,
 };
 pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
@@ -51,8 +51,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{exec_err, Constraints, Result};
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
-use datafusion_physical_expr_common::sort_expr::LexRequirement;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
 use futures::stream::{StreamExt, TryStreamExt};
 
@@ -139,7 +139,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// NOTE that checking `!is_empty()` does **not** check for a
     /// required input ordering. Instead, the correct check is that at
     /// least one entry must be `Some`
-    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
 
@@ -426,7 +426,27 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     ///
     /// For TableScan executors, which supports filter pushdown, special attention
     /// needs to be paid to whether the stats returned by this method are exact or not
+    #[deprecated(since = "48.0.0", note = "Use `partition_statistics` method instead")]
     fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    /// Returns statistics for a specific partition of this `ExecutionPlan` node.
+    /// If statistics are not available, should return [`Statistics::new_unknown`]
+    /// (the default), not an error.
+    /// If `partition` is `None`, it returns statistics for the entire plan.
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(idx) = partition {
+            // Validate partition index
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return internal_err!(
+                    "Invalid partition index: {}, the partition count is {}",
+                    idx,
+                    partition_count
+                );
+            }
+        }
         Ok(Statistics::new_unknown(&self.schema()))
     }
 
@@ -471,39 +491,83 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         Ok(None)
     }
 
-    /// Attempts to recursively push given filters from the top of the tree into leafs.
+    /// Collect filters that this node can push down to its children.
+    /// Filters that are being pushed down from parents are passed in,
+    /// and the node may generate additional filters to push down.
+    /// For example, given the plan FilterExec -> HashJoinExec -> DataSourceExec,
+    /// what will happen is that we recurse down the plan calling `ExecutionPlan::gather_filters_for_pushdown`:
+    /// 1. `FilterExec::gather_filters_for_pushdown` is called with no parent
+    ///    filters so it only returns that `FilterExec` wants to push down its own predicate.
+    /// 2. `HashJoinExec::gather_filters_for_pushdown` is called with the filter from
+    ///    `FilterExec`, which it only allows to push down to one side of the join (unless it's on the join key)
+    ///    but it also adds its own filters (e.g. pushing down a bloom filter of the hash table to the scan side of the join).
+    /// 3. `DataSourceExec::gather_filters_for_pushdown` is called with both filters from `HashJoinExec`
+    ///    and `FilterExec`, however `DataSourceExec::gather_filters_for_pushdown` doesn't actually do anything
+    ///    since it has no children and no additional filters to push down.
+    ///    It's only once [`ExecutionPlan::handle_child_pushdown_result`] is called on `DataSourceExec` as we recurse
+    ///    up the plan that `DataSourceExec` can actually bind the filters.
     ///
-    /// This is used for various optimizations, such as:
-    ///
-    /// * Pushing down filters into scans in general to minimize the amount of data that needs to be materialzied.
-    /// * Pushing down dynamic filters from operators like TopK and Joins into scans.
-    ///
-    /// Generally the further down (closer to leaf nodes) that filters can be pushed, the better.
-    ///
-    /// Consider the case of a query such as `SELECT * FROM t WHERE a = 1 AND b = 2`.
-    /// With no filter pushdown the scan needs to read and materialize all the data from `t` and then filter based on `a` and `b`.
-    /// With filter pushdown into the scan it can first read only `a`, then `b` and keep track of
-    /// which rows match the filter.
-    /// Then only for rows that match the filter does it have to materialize the rest of the columns.
-    ///
-    /// # Default Implementation
-    ///
-    /// The default implementation assumes:
-    /// * Parent filters can't be passed onto children.
-    /// * This node has no filters to contribute.
-    ///
-    /// # Implementation Notes
-    ///
-    /// Most of the actual logic is implemented as a Physical Optimizer rule.
-    /// See [`PushdownFilter`] for more details.
-    ///
-    /// [`PushdownFilter`]: https://docs.rs/datafusion/latest/datafusion/physical_optimizer/filter_pushdown/struct.PushdownFilter.html
-    fn try_pushdown_filters(
+    /// The default implementation bars all parent filters from being pushed down and adds no new filters.
+    /// This is the safest option, making filter pushdown opt-in on a per-node pasis.
+    fn gather_filters_for_pushdown(
         &self,
-        fd: FilterDescription,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
-    ) -> Result<FilterPushdownResult<Arc<dyn ExecutionPlan>>> {
-        Ok(filter_pushdown_not_supported(fd))
+    ) -> Result<FilterDescription> {
+        Ok(
+            FilterDescription::new_with_child_count(self.children().len())
+                .all_parent_filters_unsupported(parent_filters),
+        )
+    }
+
+    /// Handle the result of a child pushdown.
+    /// This is called as we recurse back up the plan tree after recursing down and calling [`ExecutionPlan::gather_filters_for_pushdown`].
+    /// Once we know what the result of pushing down filters into children is we ask the current node what it wants to do with that result.
+    /// For a `DataSourceExec` that may be absorbing the filters to apply them during the scan phase
+    /// (also known as late materialization).
+    /// A `FilterExec` may absorb any filters its children could not absorb, or if there are no filters left it
+    /// may remove itself from the plan altogether.
+    /// It combines both [`ChildPushdownResult::parent_filters`] and [`ChildPushdownResult::self_filters`] into a single
+    /// predicate and replaces it's own predicate.
+    /// Then it passes [`PredicateSupport::Supported`] for each parent predicate to the parent.
+    /// A `HashJoinExec` may ignore the pushdown result since it needs to apply the filters as part of the join anyhow.
+    /// It passes [`ChildPushdownResult::parent_filters`] back up to it's parents wrapped in [`FilterPushdownPropagation::transparent`]
+    /// and [`ChildPushdownResult::self_filters`] is discarded.
+    ///
+    /// The default implementation is a no-op that passes the result of pushdown from the children to its parent.
+    ///
+    /// When returning filters via [`FilterPushdownPropagation`] the order of the filters need not match
+    /// the order they were passed in via `child_pushdown_result`, but preserving the order may be beneficial
+    /// for debugging and reasoning about the resulting plans so it is recommended to preserve the order.
+    ///
+    /// There are various helper methods to make implementing this method easier, see:
+    /// - [`FilterPushdownPropagation::unsupported`]: to indicate that the node does not support filter pushdown at all.
+    /// - [`FilterPushdownPropagation::transparent`]: to indicate that the node supports filter pushdown but does not involve itself in it,
+    ///   instead if simply transmits the result of pushdown into its children back up to its parent.
+    /// - [`PredicateSupports::new_with_supported_check`]: takes a callback that returns true / false for each filter to indicate pushdown support.
+    ///   This can be used alongside [`FilterPushdownPropagation::with_filters`] and [`FilterPushdownPropagation::with_updated_node`]
+    ///   to dynamically build a result with a mix of supported and unsupported filters.
+    ///
+    /// [`PredicateSupport::Supported`]: crate::filter_pushdown::PredicateSupport::Supported
+    /// [`PredicateSupports::new_with_supported_check`]: crate::filter_pushdown::PredicateSupports::new_with_supported_check
+    fn handle_child_pushdown_result(
+        &self,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::transparent(
+            child_pushdown_result,
+        ))
+    }
+
+    /// Returns a version of this plan that cooperates with the runtime via
+    /// built‐in yielding. If such a version doesn't exist, returns `None`.
+    /// You do not need to do provide such a version of a custom operator,
+    /// but DataFusion will utilize it while optimizing the plan if it exists.
+    fn with_cooperative_yields(self: Arc<Self>) -> Option<Arc<dyn ExecutionPlan>> {
+        // Conservative default implementation assumes that a leaf does not
+        // cooperate with yielding.
+        None
     }
 }
 
@@ -1112,16 +1176,16 @@ pub enum CardinalityEffect {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow::array::{DictionaryArray, Int32Array, NullArray, RunArray};
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use std::any::Any;
     use std::sync::Arc;
 
+    use super::*;
+    use crate::{DisplayAs, DisplayFormatType, ExecutionPlan};
+
+    use arrow::array::{DictionaryArray, Int32Array, NullArray, RunArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion_common::{Result, Statistics};
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-
-    use crate::{DisplayAs, DisplayFormatType, ExecutionPlan};
 
     #[derive(Debug)]
     pub struct EmptyExec;
@@ -1175,6 +1239,10 @@ mod tests {
         }
 
         fn statistics(&self) -> Result<Statistics> {
+            unimplemented!()
+        }
+
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
             unimplemented!()
         }
     }
@@ -1238,6 +1306,10 @@ mod tests {
         }
 
         fn statistics(&self) -> Result<Statistics> {
+            unimplemented!()
+        }
+
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
             unimplemented!()
         }
     }
