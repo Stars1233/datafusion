@@ -66,7 +66,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         .get_table_function_source(&tbl_func_name, args)?;
                     let plan = LogicalPlanBuilder::scan(
                         TableReference::Bare {
-                            table: "tmp_table".into(),
+                            table: format!("{tbl_func_name}()").into(),
                         },
                         provider,
                         None,
@@ -92,7 +92,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             .build(),
                             (None, Err(e)) => {
                                 let e = e.with_diagnostic(Diagnostic::new_error(
-                                    format!("table '{}' not found", table_ref),
+                                    format!("table '{table_ref}' not found"),
                                     Span::try_from_sqlparser_span(relation_span),
                                 ));
                                 Err(e)

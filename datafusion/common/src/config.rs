@@ -17,16 +17,17 @@
 
 //! Runtime configuration, via [`ConfigOptions`]
 
-use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
-use std::error::Error;
-use std::fmt::{self, Display};
-use std::str::FromStr;
+use arrow_ipc::CompressionType;
 
 use crate::error::_config_err;
 use crate::parsers::CompressionTypeVariant;
 use crate::utils::get_available_parallelism;
 use crate::{DataFusionError, Result};
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
+use std::fmt::{self, Display};
+use std::str::FromStr;
 
 /// A macro that wraps a configuration struct and automatically derives
 /// [`Default`] and [`ConfigField`] for it, allowing it to be used
@@ -260,10 +261,10 @@ config_namespace! {
         /// string length and thus DataFusion can not enforce such limits.
         pub support_varchar_with_length: bool, default = true
 
-       /// If true, `VARCHAR` is mapped to `Utf8View` during SQL planning.
-       /// If false, `VARCHAR` is mapped to `Utf8`  during SQL planning.
-       /// Default is false.
-        pub map_varchar_to_utf8view: bool, default = false
+        /// If true, string types (VARCHAR, CHAR, Text, and String) are mapped to `Utf8View` during SQL planning.
+        /// If false, they are mapped to `Utf8`.
+        /// Default is true.
+        pub map_string_types_to_utf8view: bool, default = true
 
         /// When set to true, the source locations relative to the original SQL
         /// query (i.e. [`Span`](https://docs.rs/sqlparser/latest/sqlparser/tokenizer/struct.Span.html)) will be collected
@@ -272,6 +273,61 @@ config_namespace! {
 
         /// Specifies the recursion depth limit when parsing complex SQL Queries
         pub recursion_limit: usize, default = 50
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCompression {
+    Zstd,
+    Lz4Frame,
+    #[default]
+    Uncompressed,
+}
+
+impl FromStr for SpillCompression {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "zstd" => Ok(Self::Zstd),
+            "lz4_frame" => Ok(Self::Lz4Frame),
+            "uncompressed" | "" => Ok(Self::Uncompressed),
+            other => Err(DataFusionError::Configuration(format!(
+                "Invalid Spill file compression type: {other}. Expected one of: zstd, lz4_frame, uncompressed"
+            ))),
+        }
+    }
+}
+
+impl ConfigField for SpillCompression {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = SpillCompression::from_str(value)?;
+        Ok(())
+    }
+}
+
+impl Display for SpillCompression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Zstd => "zstd",
+            Self::Lz4Frame => "lz4_frame",
+            Self::Uncompressed => "uncompressed",
+        };
+        write!(f, "{str}")
+    }
+}
+
+impl From<SpillCompression> for Option<CompressionType> {
+    fn from(c: SpillCompression) -> Self {
+        match c {
+            SpillCompression::Zstd => Some(CompressionType::ZSTD),
+            SpillCompression::Lz4Frame => Some(CompressionType::LZ4_FRAME),
+            SpillCompression::Uncompressed => None,
+        }
     }
 }
 
@@ -293,8 +349,10 @@ config_namespace! {
         /// target batch size is determined by the configuration setting
         pub coalesce_batches: bool, default = true
 
-        /// Should DataFusion collect statistics after listing files
-        pub collect_statistics: bool, default = false
+        /// Should DataFusion collect statistics when first creating a table.
+        /// Has no effect after the table is created. Applies to the default
+        /// `ListingTableProvider` in DataFusion. Defaults to true.
+        pub collect_statistics: bool, default = true
 
         /// Number of partitions for query execution. Increasing partitions can increase
         /// concurrency.
@@ -328,6 +386,16 @@ config_namespace! {
         /// This is used to workaround bugs in the planner that are now caught by
         /// the new schema verification step.
         pub skip_physical_aggregate_schema_check: bool, default = false
+
+        /// Sets the compression codec used when spilling data to disk.
+        ///
+        /// Since datafusion writes spill files using the Arrow IPC Stream format,
+        /// only codecs supported by the Arrow IPC Stream Writer are allowed.
+        /// Valid values are: uncompressed, lz4_frame, zstd.
+        /// Note: lz4_frame offers faster (de)compression, but typically results in
+        /// larger spill files. In contrast, zstd achieves
+        /// higher compression ratios at the cost of slower (de)compression speed.
+        pub spill_compression: SpillCompression, default = SpillCompression::Uncompressed
 
         /// Specifies the reserved memory for each spillable sort operation to
         /// facilitate an in-memory merge.
@@ -405,6 +473,13 @@ config_namespace! {
         /// in joins can reduce memory usage when joining large
         /// tables with a highly-selective join filter, but is also slightly slower.
         pub enforce_batch_size_in_joins: bool, default = false
+
+        /// Size (bytes) of data buffer DataFusion uses when writing output files.
+        /// This affects the size of the data chunks that are uploaded to remote
+        /// object stores (e.g. AWS S3). If very large (>= 100 GiB) output files are being
+        /// written, it may be necessary to increase this size to avoid errors from
+        /// the remote end point.
+        pub objectstore_writer_buffer_size: usize, default = 10 * 1024 * 1024
     }
 }
 
@@ -466,6 +541,9 @@ config_namespace! {
         /// to write values with a larger date range than 64-bit timestamps with
         /// nanosecond resolution.
         pub coerce_int96: Option<String>, transform = str::to_lowercase, default = None
+
+        /// (reading) Use any available bloom filters when reading parquet files
+        pub bloom_filter_on_read: bool, default = true
 
         // The following options affect writing to parquet files
         // and map to parquet::file::properties::WriterProperties
@@ -542,9 +620,6 @@ config_namespace! {
         /// default parquet writer setting
         pub encoding: Option<String>, transform = str::to_lowercase, default = None
 
-        /// (writing) Use any available bloom filters when reading parquet files
-        pub bloom_filter_on_read: bool, default = true
-
         /// (writing) Write bloom filters for all columns when creating parquet files
         pub bloom_filter_on_write: bool, default = false
 
@@ -606,6 +681,13 @@ config_namespace! {
         /// during aggregations, if possible
         pub enable_topk_aggregation: bool, default = true
 
+        /// When set to true attempts to push down dynamic filters generated by operators into the file scan phase.
+        /// For example, for a query such as `SELECT * FROM t ORDER BY timestamp DESC LIMIT 10`, the optimizer
+        /// will attempt to push down the current top 10 timestamps that the TopK operator references into the file scans.
+        /// This means that if we already have 10 timestamps in the year 2025
+        /// any files that only have timestamps in the year 2024 can be skipped / pruned at various stages in the scan.
+        pub enable_dynamic_filter_pushdown: bool, default = true
+
         /// When set to true, the optimizer will insert filters before a join between
         /// a nullable and non-nullable column to filter out nulls on the nullable side. This
         /// filter can add additional overhead when the file format does not fully support
@@ -632,13 +714,20 @@ config_namespace! {
         /// long runner execution, all types of joins may encounter out-of-memory errors.
         pub allow_symmetric_joins_without_pruning: bool, default = true
 
-        /// When set to `true`, file groups will be repartitioned to achieve maximum parallelism.
-        /// Currently Parquet and CSV formats are supported.
+        /// When set to `true`, datasource partitions will be repartitioned to achieve maximum parallelism.
+        /// This applies to both in-memory partitions and FileSource's file groups (1 group is 1 partition).
         ///
-        /// If set to `true`, all files will be repartitioned evenly (i.e., a single large file
+        /// For FileSources, only Parquet and CSV formats are currently supported.
+        ///
+        /// If set to `true` for a FileSource, all files will be repartitioned evenly (i.e., a single large file
         /// might be partitioned into smaller chunks) for parallel scanning.
-        /// If set to `false`, different files will be read in parallel, but repartitioning won't
+        /// If set to `false` for a FileSource, different files will be read in parallel, but repartitioning won't
         /// happen within a single file.
+        ///
+        /// If set to `true` for an in-memory source, all memtable's partitions will have their batches
+        /// repartitioned evenly to the desired number of `target_partitions`. Repartitioning can change
+        /// the total number of partitions and batches per partition, but does not slice the initial
+        /// record tables provided to the MemTable on creation.
         pub repartition_file_scans: bool, default = true
 
         /// Should DataFusion repartition data using the partitions keys to execute window
@@ -752,6 +841,59 @@ impl ExecutionOptions {
     }
 }
 
+config_namespace! {
+    /// Options controlling the format of output when printing record batches
+    /// Copies [`arrow::util::display::FormatOptions`]
+    pub struct FormatOptions {
+        /// If set to `true` any formatting errors will be written to the output
+        /// instead of being converted into a [`std::fmt::Error`]
+        pub safe: bool, default = true
+        /// Format string for nulls
+        pub null: String, default = "".into()
+        /// Date format for date arrays
+        pub date_format: Option<String>, default = Some("%Y-%m-%d".to_string())
+        /// Format for DateTime arrays
+        pub datetime_format: Option<String>, default = Some("%Y-%m-%dT%H:%M:%S%.f".to_string())
+        /// Timestamp format for timestamp arrays
+        pub timestamp_format: Option<String>, default = Some("%Y-%m-%dT%H:%M:%S%.f".to_string())
+        /// Timestamp format for timestamp with timezone arrays. When `None`, ISO 8601 format is used.
+        pub timestamp_tz_format: Option<String>, default = None
+        /// Time format for time arrays
+        pub time_format: Option<String>, default = Some("%H:%M:%S%.f".to_string())
+        /// Duration format. Can be either `"pretty"` or `"ISO8601"`
+        pub duration_format: String, transform = str::to_lowercase, default = "pretty".into()
+        /// Show types in visual representation batches
+        pub types_info: bool, default = false
+    }
+}
+
+impl<'a> TryInto<arrow::util::display::FormatOptions<'a>> for &'a FormatOptions {
+    type Error = DataFusionError;
+    fn try_into(self) -> Result<arrow::util::display::FormatOptions<'a>> {
+        let duration_format = match self.duration_format.as_str() {
+            "pretty" => arrow::util::display::DurationFormat::Pretty,
+            "iso8601" => arrow::util::display::DurationFormat::ISO8601,
+            _ => {
+                return _config_err!(
+                    "Invalid duration format: {}. Valid values are pretty or iso8601",
+                    self.duration_format
+                )
+            }
+        };
+
+        Ok(arrow::util::display::FormatOptions::new()
+            .with_display_error(self.safe)
+            .with_null(&self.null)
+            .with_date_format(self.date_format.as_deref())
+            .with_datetime_format(self.datetime_format.as_deref())
+            .with_timestamp_format(self.timestamp_format.as_deref())
+            .with_timestamp_tz_format(self.timestamp_tz_format.as_deref())
+            .with_time_format(self.time_format.as_deref())
+            .with_duration_format(duration_format)
+            .with_types_info(self.types_info))
+    }
+}
+
 /// A key value pair, with a corresponding description
 #[derive(Debug)]
 pub struct ConfigEntry {
@@ -781,6 +923,8 @@ pub struct ConfigOptions {
     pub explain: ExplainOptions,
     /// Optional extensions registered using [`Extensions::insert`]
     pub extensions: Extensions,
+    /// Formatting options when printing batches
+    pub format: FormatOptions,
 }
 
 impl ConfigField for ConfigOptions {
@@ -793,6 +937,7 @@ impl ConfigField for ConfigOptions {
             "optimizer" => self.optimizer.set(rem, value),
             "explain" => self.explain.set(rem, value),
             "sql_parser" => self.sql_parser.set(rem, value),
+            "format" => self.format.set(rem, value),
             _ => _config_err!("Config value \"{key}\" not found on ConfigOptions"),
         }
     }
@@ -803,6 +948,7 @@ impl ConfigField for ConfigOptions {
         self.optimizer.visit(v, "datafusion.optimizer", "");
         self.explain.visit(v, "datafusion.explain", "");
         self.sql_parser.visit(v, "datafusion.sql_parser", "");
+        self.format.visit(v, "datafusion.format", "");
     }
 }
 
@@ -864,7 +1010,9 @@ impl ConfigOptions {
         for key in keys.0 {
             let env = key.to_uppercase().replace('.', "_");
             if let Some(var) = std::env::var_os(env) {
-                ret.set(&key, var.to_string_lossy().as_ref())?;
+                let value = var.to_string_lossy();
+                log::info!("Set {key} to {value} from the environment variable");
+                ret.set(&key, value.as_ref())?;
             }
         }
 
@@ -1151,8 +1299,7 @@ impl ConfigField for u8 {
     fn set(&mut self, key: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Err(DataFusionError::Configuration(format!(
-                "Input string for {} key is empty",
-                key
+                "Input string for {key} key is empty"
             )));
         }
         // Check if the string is a valid number
@@ -1164,8 +1311,7 @@ impl ConfigField for u8 {
             // Check if the first character is ASCII (single byte)
             if bytes.len() > 1 || !value.chars().next().unwrap().is_ascii() {
                 return Err(DataFusionError::Configuration(format!(
-                    "Error parsing {} as u8. Non-ASCII string provided",
-                    value
+                    "Error parsing {value} as u8. Non-ASCII string provided"
                 )));
             }
             *self = bytes[0];
@@ -1995,11 +2141,11 @@ config_namespace! {
     }
 }
 
-pub trait FormatOptionsExt: Display {}
+pub trait OutputFormatExt: Display {}
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
-pub enum FormatOptions {
+pub enum OutputFormat {
     CSV(CsvOptions),
     JSON(JsonOptions),
     #[cfg(feature = "parquet")]
@@ -2008,17 +2154,17 @@ pub enum FormatOptions {
     ARROW,
 }
 
-impl Display for FormatOptions {
+impl Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let out = match self {
-            FormatOptions::CSV(_) => "csv",
-            FormatOptions::JSON(_) => "json",
+            OutputFormat::CSV(_) => "csv",
+            OutputFormat::JSON(_) => "json",
             #[cfg(feature = "parquet")]
-            FormatOptions::PARQUET(_) => "parquet",
-            FormatOptions::AVRO => "avro",
-            FormatOptions::ARROW => "arrow",
+            OutputFormat::PARQUET(_) => "parquet",
+            OutputFormat::AVRO => "avro",
+            OutputFormat::ARROW => "arrow",
         };
-        write!(f, "{}", out)
+        write!(f, "{out}")
     }
 }
 

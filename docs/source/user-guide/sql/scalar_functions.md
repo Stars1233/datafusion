@@ -2133,7 +2133,7 @@ _Alias of [date_trunc](#date_trunc)._
 
 ### `from_unixtime`
 
-Converts an integer to RFC3339 timestamp format (`YYYY-MM-DDT00:00:00.000000000Z`). Integers and unsigned integers are interpreted as nanoseconds since the unix epoch (`1970-01-01T00:00:00Z`) return the corresponding timestamp.
+Converts an integer to RFC3339 timestamp format (`YYYY-MM-DDT00:00:00.000000000Z`). Integers and unsigned integers are interpreted as seconds since the unix epoch (`1970-01-01T00:00:00Z`) return the corresponding timestamp.
 
 ```sql
 from_unixtime(expression[, timezone])
@@ -3142,7 +3142,7 @@ array_pop_front(array)
 
 ### `array_position`
 
-Returns the position of the first occurrence of the specified element in the array.
+Returns the position of the first occurrence of the specified element in the array, or NULL if not found.
 
 ```sql
 array_position(array, element)
@@ -3153,7 +3153,7 @@ array_position(array, element, index)
 
 - **array**: Array expression. Can be a constant, column, or function, and any combination of array operators.
 - **element**: Element to search for position in the array.
-- **index**: Index at which to start searching.
+- **index**: Index at which to start searching (1-indexed).
 
 #### Example
 
@@ -4404,6 +4404,7 @@ sha512(expression)
 Functions to work with the union data type, also know as tagged unions, variant types, enums or sum types. Note: Not related to the SQL UNION operator
 
 - [union_extract](#union_extract)
+- [union_tag](#union_tag)
 
 ### `union_extract`
 
@@ -4431,6 +4432,33 @@ union_extract(union, field_name)
 | {b=}         |                                  |                                  |
 | {a=}         |                                  |                                  |
 +--------------+----------------------------------+----------------------------------+
+```
+
+### `union_tag`
+
+Returns the name of the currently selected field in the union
+
+```sql
+union_tag(union_expression)
+```
+
+#### Arguments
+
+- **union**: Union expression to operate on. Can be a constant, column, or function, and any combination of operators.
+
+#### Example
+
+```sql
+❯ select union_column, union_tag(union_column) from table_with_union;
++--------------+-------------------------+
+| union_column | union_tag(union_column) |
++--------------+-------------------------+
+| {a=1}        | a                       |
+| {b=3.0}      | b                       |
+| {a=4}        | a                       |
+| {b=}         | b                       |
+| {a=}         | a                       |
++--------------+-------------------------+
 ```
 
 ## Other Functions
