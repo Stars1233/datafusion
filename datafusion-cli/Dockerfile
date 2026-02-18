@@ -23,7 +23,7 @@ WORKDIR /usr/src/datafusion
 
 RUN cargo build -p datafusion-cli --release
 
-FROM debian:bookworm-slim
+FROM debian:12.11-slim
 
 COPY --from=builder /usr/src/datafusion/target/release/datafusion-cli /usr/local/bin
 
